@@ -2,7 +2,7 @@
 CC = gcc
 
 # 编译选项 -Wall -Wextra 用于显示所有警告信息，-fPIC 用于生成位置独立代码（共享库需要）
-CFLAGS = -fPIC -Wall -Wextra
+CFLAGS = -fPIC -Wall -Wextra -std=c99
 
 # 链接选项 -shared 表示生成共享库，-Wl,-soname,... 用于定义库的 soname
 LDFLAGS = -shared -Wl,-soname,libnss_hs.so.2  -lpthread -lresolv
