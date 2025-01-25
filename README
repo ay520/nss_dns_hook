@@ -1,0 +1,30 @@
+nsswitch user dns hook--基于nsswitch原理，实现对系统的dns hook
+处置逻辑
+1、系统发起解析域名
+2、如果返回获取到的IP是内网地址，放行不处置
+   如果IP是公网地址，对域名进行白名单配置比对，如果在白名单里，放行，否则直接劫持本次dns请求
+
+部署方案
+确保在 /etc/nsswitch.conf 中适当配置 hosts 条目让自定义模块参与解析。
+找到 hosts: files hs dns  # 在files 和 dns 之间 新增 hs模块
+
+修改白名单配置文件/etc/nss_whitelist.conf,域名支持范解析匹配
+比如：
+*.baidu.com
+*.github.com
+github.com
+*.weibo.com
+www.sina.com
+mobile.events.data.microsoft.com
+default.exp-tas.com
+*.aliyuncs.com
+mirrors.cloud.aliyuncs.com
+*.vscode-cdn.net
+www.google.com
+*.aliyun.com
+
+同时可以自定义私网IP段，配置文件路径/etc/nss_private_networks.conf
+比如：100.100.0.0/16
+
+
+
