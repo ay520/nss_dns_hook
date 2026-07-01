@@ -46,6 +46,12 @@ static struct whitelist_entry *whitelist_build_hash(int *out_count, time_t *out_
     struct stat st;
     if (stat(WHITELIST_FILE, &st) == 0) {
         *out_mtime = st.st_mtime;
+    } else if (fstat(fileno(fp), &st) == 0) {
+        // stat 失败但 fopen 成功(文件可能被替换),回退到 fstat
+        *out_mtime = st.st_mtime;
+    } else {
+        // 都失败,用当前时间作非零哨兵,保证下次 check_mtime 能检测到变化
+        *out_mtime = time(NULL);
     }
 
     struct whitelist_entry *new_hash = NULL;
@@ -83,39 +89,44 @@ void whitelist_initial_load(void) {
     struct whitelist_entry *new_hash = whitelist_build_hash(&count, &mtime);
 
     pthread_rwlock_wrlock(&whitelist_lock);
-    whitelist_free_hash(whitelist_hash);
+    struct whitelist_entry *old = whitelist_hash;
     whitelist_hash = new_hash;
     whitelist_count = count;
     whitelist_mtime = mtime;
     pthread_rwlock_unlock(&whitelist_lock);
+
+    // old hash 在锁外释放,避免阻塞并发读者
+    if (old) whitelist_free_hash(old);
 }
 
 void whitelist_check_mtime(void) {
     struct stat st;
     if (stat(WHITELIST_FILE, &st) != 0) return;
-    if (st.st_mtime == whitelist_mtime) return;
+    // 记录决策时的 mtime,用于 wrlock 下的 double-check
+    time_t old_mtime = whitelist_mtime;
+    if (st.st_mtime == old_mtime) return;
 
-    // Build new hash outside lock (expensive: file I/O + parse)
+    // 在锁外构建新 hash(耗时:文件 I/O + 解析)
     int count;
     time_t mtime;
     struct whitelist_entry *new_hash = whitelist_build_hash(&count, &mtime);
 
+    struct whitelist_entry *old_to_free = NULL;
     pthread_rwlock_wrlock(&whitelist_lock);
-    // Double-check: another thread may have reloaded already
-    if (mtime != whitelist_mtime) {
-        struct whitelist_entry *old = whitelist_hash;
+    // double-check:若全局 mtime 仍是 old_mtime,说明没有其他线程重载过,执行 swap
+    // 若全局 mtime 已变(其他线程重载了更新版本),跳过 swap,丢弃本次 new_hash
+    if (whitelist_mtime == old_mtime) {
+        old_to_free = whitelist_hash;
         whitelist_hash = new_hash;
         whitelist_count = count;
         whitelist_mtime = mtime;
-        new_hash = NULL;  // consumed by swap
-        whitelist_free_hash(old);
+        new_hash = NULL;  // 已 swap,标记不需要在外面释放
     }
     pthread_rwlock_unlock(&whitelist_lock);
 
-    // If we didn't swap (another thread won the race), free unused new_hash
-    if (new_hash) {
-        whitelist_free_hash(new_hash);
-    }
+    // 锁外释放:丢弃的 new_hash(竞态输掉)或被替换的 old hash
+    if (new_hash) whitelist_free_hash(new_hash);
+    if (old_to_free) whitelist_free_hash(old_to_free);
 }
 
 int whitelist_match(const char *domain) {

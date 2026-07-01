@@ -519,21 +519,25 @@ enum nss_status _nss_hs_gethostbyname4_r(
 
         len_a = res_nquery(&res, name, C_IN, T_A, answer_a, NS_MAXMSG);
         if (len_a > 0) {
+            int count_before = addr_count;
             int added = parse_answer_and_add(&buf, answer_a, len_a, AF_INET,
                                              pat, &prev, &addr_count, name, &min_ttl_a);
-            if (added <= 0) {
-                neg_a_local = 1;        // NXDOMAIN / 无 A 记录 / 解析失败
-                if (added < 0) len_a = 0; // 解析失败:不缓存原始字节
+            if (addr_count == count_before) {
+                // 没加到任何地址:NXDOMAIN / CNAME-only / 解析失败
+                neg_a_local = 1;
+                if (added < 0) len_a = 0;  // 解析失败:不缓存原始字节
             }
+            // else: 部分或全部成功(即便 added<0 也是 buffer 满导致的,已加的地址有效)
         } else {
             neg_a_local = 1;
         }
 
         len_aaaa = res_nquery(&res, name, C_IN, T_AAAA, answer_aaaa, NS_MAXMSG);
         if (len_aaaa > 0) {
+            int count_before = addr_count;
             int added = parse_answer_and_add(&buf, answer_aaaa, len_aaaa, AF_INET6,
                                              pat, &prev, &addr_count, name, &min_ttl_aaaa);
-            if (added <= 0) {
+            if (addr_count == count_before) {
                 neg_aaaa_local = 1;
                 if (added < 0) len_aaaa = 0;
             }
