@@ -1,3 +1,4 @@
+#define _GNU_SOURCE
 #include "dns_log.h"
 #include <syslog.h>
 #include <stdarg.h>

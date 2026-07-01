@@ -119,7 +119,7 @@ proc_stat get_proc_stat(int Pid) {
     }
 
     sscanf(last_paren + 1,
-        " %c %d %d %d %d %d %u %lu %lu %lu %lu %lu %lu %ld %ld %ld %ld %ld %ld %llu %lu %ld %lu %lu %lu %lu %lu %lu %lu %lu %lu %lu %lu %lu %d %d %u %u %llu %lu %ld %lu %lu %lu %lu %lu %lu %lu %d",
+        " %c %d %d %d %d %d %u %lu %lu %lu %lu %lu %lu %ld %ld %ld %ld %ld %ld %llu %lu %ld %lu %lu %lu %lu %lu %lu %lu %lu %lu %lu %lu %lu %lu %d %d %u %u %llu %lu %ld %lu %lu %lu %lu %lu %lu %lu %d",
         &stat.state, &stat.ppid, &stat.pgid, &stat.session, &stat.tty_nr, &stat.tpgid,
         &stat.flags, &stat.minflt, &stat.cminflt, &stat.majflt, &stat.cmajflt,
         &stat.utime, &stat.stime, &stat.cutime, &stat.cstime, &stat.priority, &stat.nice,

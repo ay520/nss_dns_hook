@@ -401,7 +401,7 @@ static int parse_answer_and_add(
     }
 
     int count = ns_msg_count(handle, ns_s_an);
-    int rr_type = (af == AF_INET) ? ns_t_a : ns_t_aaaa;
+    ns_type rr_type = (af == AF_INET) ? ns_t_a : ns_t_aaaa;
 
     for (int i = 0; i < count && *addr_count < MAX_ADDRESSES; i++) {
         if (ns_parserr(&handle, ns_s_an, i, &rr) < 0) {
@@ -596,7 +596,7 @@ enum nss_status _nss_hs_gethostbyname3_r(
     }
 
     // 转换结果格式
-    result->h_name = name;
+    result->h_name = (char *)name;
     result->h_aliases = NULL;
     result->h_addrtype = af;
     result->h_length = (af == AF_INET) ? 4 : 16;
