@@ -53,8 +53,8 @@ static void cache_entry_free(struct cache_entry *e) {
 }
 
 int dns_cache_get(const char *domain,
-                  unsigned char **out_a, size_t *out_a_len, int *out_neg_a,
-                  unsigned char **out_aaaa, size_t *out_aaaa_len, int *out_neg_aaaa) {
+                  unsigned char *out_a, size_t out_a_cap, size_t *out_a_len, int *out_neg_a,
+                  unsigned char *out_aaaa, size_t out_aaaa_cap, size_t *out_aaaa_len, int *out_neg_aaaa) {
     pthread_rwlock_rdlock(&cache_lock);
 
     struct cache_entry *e;
@@ -69,11 +69,20 @@ int dns_cache_get(const char *domain,
         return 0;
     }
 
-    *out_a = e->answer_a;
-    *out_a_len = e->answer_a_len;
+    if (e->answer_a && e->answer_a_len > 0 && e->answer_a_len <= out_a_cap) {
+        memcpy(out_a, e->answer_a, e->answer_a_len);
+        *out_a_len = e->answer_a_len;
+    } else {
+        *out_a_len = 0;
+    }
     *out_neg_a = e->negative_a;
-    *out_aaaa = e->answer_aaaa;
-    *out_aaaa_len = e->answer_aaaa_len;
+
+    if (e->answer_aaaa && e->answer_aaaa_len > 0 && e->answer_aaaa_len <= out_aaaa_cap) {
+        memcpy(out_aaaa, e->answer_aaaa, e->answer_aaaa_len);
+        *out_aaaa_len = e->answer_aaaa_len;
+    } else {
+        *out_aaaa_len = 0;
+    }
     *out_neg_aaaa = e->negative_aaaa;
 
     pthread_rwlock_unlock(&cache_lock);

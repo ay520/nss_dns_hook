@@ -172,7 +172,8 @@ static bool ipv6_in_network(const uint8_t *addr, const struct ipv6_network *netw
 // 修改 is_private_ip 函数
 static bool is_private_ip(const unsigned char *addr, int family) {
     if (family == AF_INET) {
-        uint32_t ip = *(uint32_t*)addr;
+        uint32_t ip;
+        memcpy(&ip, addr, 4);  // addr 来自 ns_rr_rdata,可能是非对齐指针
         ip = ntohl(ip);
         
         // 标准私有网络检查
@@ -474,32 +475,40 @@ enum nss_status _nss_hs_gethostbyname4_r(
     }
 
     struct buffer_data buf = { .buffer = buffer, .buflen = buflen, .offset = 0 };
-    unsigned char answer_a[NS_MAXMSG];
-    unsigned char answer_aaaa[NS_MAXMSG];
+    // heap 分配避免 128KB 栈帧(NS_MAXMSG=65535 × 2)
+    unsigned char *answer_a = malloc(NS_MAXMSG);
+    unsigned char *answer_aaaa = malloc(NS_MAXMSG);
+    if (!answer_a || !answer_aaaa) {
+        free(answer_a); free(answer_aaaa);
+        *errnop = ENOMEM;
+        *h_errnop = NO_RECOVERY;
+        return NSS_STATUS_TRYAGAIN;
+    }
     int addr_count = 0;
     struct gaih_addrtuple *prev = NULL;
     int min_ttl_a = DEFAULT_TTL, min_ttl_aaaa = DEFAULT_TTL;
 
-    unsigned char *cached_a = NULL, *cached_aaaa = NULL;
-    size_t cached_a_len = 0, cached_aaaa_len = 0;
+    size_t a_len = 0, aaaa_len = 0;
     int neg_a = 0, neg_aaaa = 0;
 
-    int cache_hit = dns_cache_get(name, &cached_a, &cached_a_len, &neg_a,
-                                  &cached_aaaa, &cached_aaaa_len, &neg_aaaa);
+    // cache_get 在读锁内 memcpy 到调用方 buffer,锁释放后调用方安全使用
+    int cache_hit = dns_cache_get(name, answer_a, NS_MAXMSG, &a_len, &neg_a,
+                                  answer_aaaa, NS_MAXMSG, &aaaa_len, &neg_aaaa);
 
     if (cache_hit) {
         dns_log(LOG_DEBUG, "Cache hit for %s", name);
-        if (cached_a && cached_a_len > 0) {
-            parse_answer_and_add(&buf, cached_a, (int)cached_a_len, AF_INET,
+        if (a_len > 0) {
+            parse_answer_and_add(&buf, answer_a, (int)a_len, AF_INET,
                                  pat, &prev, &addr_count, name, &min_ttl_a);
         }
-        if (cached_aaaa && cached_aaaa_len > 0) {
-            parse_answer_and_add(&buf, cached_aaaa, (int)cached_aaaa_len, AF_INET6,
+        if (aaaa_len > 0) {
+            parse_answer_and_add(&buf, answer_aaaa, (int)aaaa_len, AF_INET6,
                                  pat, &prev, &addr_count, name, &min_ttl_aaaa);
         }
     } else {
         struct __res_state res;
         if (res_ninit(&res) != 0) {
+            free(answer_a); free(answer_aaaa);
             *errnop = EAGAIN;
             *h_errnop = NO_RECOVERY;
             return NSS_STATUS_UNAVAIL;
@@ -508,18 +517,26 @@ enum nss_status _nss_hs_gethostbyname4_r(
         int len_a = 0, len_aaaa = 0;
         int neg_a_local = 0, neg_aaaa_local = 0;
 
-        len_a = res_nquery(&res, name, C_IN, T_A, answer_a, sizeof(answer_a));
+        len_a = res_nquery(&res, name, C_IN, T_A, answer_a, NS_MAXMSG);
         if (len_a > 0) {
-            parse_answer_and_add(&buf, answer_a, len_a, AF_INET,
-                                 pat, &prev, &addr_count, name, &min_ttl_a);
+            int added = parse_answer_and_add(&buf, answer_a, len_a, AF_INET,
+                                             pat, &prev, &addr_count, name, &min_ttl_a);
+            if (added <= 0) {
+                neg_a_local = 1;        // NXDOMAIN / 无 A 记录 / 解析失败
+                if (added < 0) len_a = 0; // 解析失败:不缓存原始字节
+            }
         } else {
             neg_a_local = 1;
         }
 
-        len_aaaa = res_nquery(&res, name, C_IN, T_AAAA, answer_aaaa, sizeof(answer_aaaa));
+        len_aaaa = res_nquery(&res, name, C_IN, T_AAAA, answer_aaaa, NS_MAXMSG);
         if (len_aaaa > 0) {
-            parse_answer_and_add(&buf, answer_aaaa, len_aaaa, AF_INET6,
-                                 pat, &prev, &addr_count, name, &min_ttl_aaaa);
+            int added = parse_answer_and_add(&buf, answer_aaaa, len_aaaa, AF_INET6,
+                                             pat, &prev, &addr_count, name, &min_ttl_aaaa);
+            if (added <= 0) {
+                neg_aaaa_local = 1;
+                if (added < 0) len_aaaa = 0;
+            }
         } else {
             neg_aaaa_local = 1;
         }
@@ -530,6 +547,9 @@ enum nss_status _nss_hs_gethostbyname4_r(
                       len_a > 0 ? answer_a : NULL, len_a > 0 ? (size_t)len_a : 0, neg_a_local, min_ttl_a,
                       len_aaaa > 0 ? answer_aaaa : NULL, len_aaaa > 0 ? (size_t)len_aaaa : 0, neg_aaaa_local, min_ttl_aaaa);
     }
+
+    free(answer_a);
+    free(answer_aaaa);
 
     if (addr_count == 0) {
         dns_log(LOG_INFO, "No addresses found for %s", name);
@@ -543,8 +563,12 @@ enum nss_status _nss_hs_gethostbyname4_r(
         print_address_list(*pat);
     }
 
+    // 返回给 glibc 的 TTL:取 A/AAAA 最小值,限制在 DEFAULT_TTL 内
     if (ttlp) {
-        *ttlp = DEFAULT_TTL;
+        int ttl = min_ttl_a;
+        if (min_ttl_aaaa > 0 && (ttl <= 0 || min_ttl_aaaa < ttl)) ttl = min_ttl_aaaa;
+        if (ttl <= 0 || ttl > DEFAULT_TTL) ttl = DEFAULT_TTL;
+        *ttlp = ttl;
     }
 
     dns_log(LOG_INFO, "Successfully resolved %s with %d addresses", name, addr_count);
@@ -574,11 +598,7 @@ enum nss_status _nss_hs_gethostbyname3_r(
         return NSS_STATUS_UNAVAIL;
     }
 
-    char *cmdline=read_cmdline(getpid());
-    char *exe_path=read_proc_path(getpid());
-    dns_log(LOG_INFO, "ns(3) hook domain: %s pid: %d,program:%s,proc_path:%s", name, getpid(),cmdline,exe_path); // 记录日志信息，包括域名和进程ID
-    free(cmdline);
-    free(exe_path);
+    // 日志在 byname4_r 统一记录,这里不重复
 
     // 分配临时缓冲区用于 gethostbyname4_r
     char *tmp_buffer = malloc(buflen);
@@ -658,45 +678,29 @@ enum nss_status _nss_hs_gethostbyname3_r(
 
 // _nss_hs_gethostbyname2_r函数用于支持较旧的接口，并返回基本的地址信息
 enum nss_status _nss_hs_gethostbyname2_r(
-    const char *name,        // 要解析的主机名
-    int af,                  // 地址协议族
-    struct hostent *result,    // 用于存储解析结果的结构
-    char *buffer,            // 缓冲区
-    size_t buflen,           // 缓冲区大小
-    int *errnop,             // 错误码指针
-    int *h_errnop            // 主机错误码指针
+    const char *name,
+    int af,
+    struct hostent *result,
+    char *buffer,
+    size_t buflen,
+    int *errnop,
+    int *h_errnop
 ) {
-    
-    
-    char *cmdline=read_cmdline(getpid());
-    char *exe_path=read_proc_path(getpid());
-    dns_log(LOG_INFO, "ns(2) hook domain: %s pid: %d,program:%s,proc_path:%s", name, getpid(),cmdline,exe_path); // 记录日志信息，包括域名和进程ID
-    free(cmdline);
-    free(exe_path);
-
+    // 日志在 byname4_r 统一记录,这里不重复
     return _nss_hs_gethostbyname3_r(name, af, result, buffer, buflen, errnop, h_errnop, NULL, NULL);
-
-
 }
 
 // _nss_hs_gethostbyname_r函数实际上是最原始的接口，用于解析任意主机名，默认支持IPv4
 enum nss_status _nss_hs_gethostbyname_r(
-    const char *name,        // 要解析的主机名
-    struct hostent *result,    // 用于存储解析结果的结构
-    char *buffer,            // 缓冲区
-    size_t buflen,           // 缓冲区大小
-    int *errnop,             // 错误码指针
-    int *h_errnop            // 主机错误码指针
+    const char *name,
+    struct hostent *result,
+    char *buffer,
+    size_t buflen,
+    int *errnop,
+    int *h_errnop
 ) {
-
-
-    char *cmdline=read_cmdline(getpid());
-    char *exe_path=read_proc_path(getpid());
-    dns_log(LOG_INFO, "ns hook domain: %s pid: %d,program:%s,proc_path:%s", name, getpid(),cmdline,exe_path); // 记录日志信息，包括域名和进程ID
-    free(cmdline);
-    free(exe_path);
-
-    return _nss_hs_gethostbyname2_r(name, AF_INET, result, buffer, buflen, errnop, h_errnop);  
+    // 日志在 byname4_r 统一记录,这里不重复
+    return _nss_hs_gethostbyname2_r(name, AF_INET, result, buffer, buflen, errnop, h_errnop);
 }
 
 

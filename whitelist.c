@@ -19,27 +19,33 @@ static time_t whitelist_mtime = 0;
 static int whitelist_count = 0;
 static pthread_rwlock_t whitelist_lock = PTHREAD_RWLOCK_INITIALIZER;
 
-static void whitelist_free_hash_locked(void) {
-    if (!whitelist_hash) return;
+// Free all entries in an arbitrary hash (caller manages the head pointer)
+static void whitelist_free_hash(struct whitelist_entry *hash) {
+    if (!hash) return;
     struct whitelist_entry *cur, *tmp;
-    HASH_ITER(hh, whitelist_hash, cur, tmp) {
-        HASH_DEL(whitelist_hash, cur);
+    HASH_ITER(hh, hash, cur, tmp) {
+        HASH_DEL(hash, cur);
         free(cur->domain);
         free(cur);
     }
-    whitelist_hash = NULL;
 }
 
-static int whitelist_reload_locked(void) {
+// Read whitelist file and build a new hash. Returns new_hash (NULL if file
+// missing/empty). Sets *out_count and *out_mtime. Does NOT touch global state
+// — caller swaps under lock.
+static struct whitelist_entry *whitelist_build_hash(int *out_count, time_t *out_mtime) {
+    *out_count = 0;
+    *out_mtime = 0;
+
     FILE *fp = fopen(WHITELIST_FILE, "r");
     if (!fp) {
         dns_log(LOG_WARNING, "Could not open whitelist file: %s", WHITELIST_FILE);
-        return -1;
+        return NULL;
     }
 
     struct stat st;
     if (stat(WHITELIST_FILE, &st) == 0) {
-        whitelist_mtime = st.st_mtime;
+        *out_mtime = st.st_mtime;
     }
 
     struct whitelist_entry *new_hash = NULL;
@@ -66,16 +72,21 @@ static int whitelist_reload_locked(void) {
     }
     fclose(fp);
 
-    whitelist_free_hash_locked();
-    whitelist_hash = new_hash;
-    whitelist_count = count;
+    *out_count = count;
     dns_log(LOG_INFO, "Loaded %d domains into whitelist", count);
-    return 0;
+    return new_hash;
 }
 
 void whitelist_initial_load(void) {
+    int count;
+    time_t mtime;
+    struct whitelist_entry *new_hash = whitelist_build_hash(&count, &mtime);
+
     pthread_rwlock_wrlock(&whitelist_lock);
-    whitelist_reload_locked();
+    whitelist_free_hash(whitelist_hash);
+    whitelist_hash = new_hash;
+    whitelist_count = count;
+    whitelist_mtime = mtime;
     pthread_rwlock_unlock(&whitelist_lock);
 }
 
@@ -84,11 +95,27 @@ void whitelist_check_mtime(void) {
     if (stat(WHITELIST_FILE, &st) != 0) return;
     if (st.st_mtime == whitelist_mtime) return;
 
+    // Build new hash outside lock (expensive: file I/O + parse)
+    int count;
+    time_t mtime;
+    struct whitelist_entry *new_hash = whitelist_build_hash(&count, &mtime);
+
     pthread_rwlock_wrlock(&whitelist_lock);
-    if (stat(WHITELIST_FILE, &st) == 0 && st.st_mtime != whitelist_mtime) {
-        whitelist_reload_locked();
+    // Double-check: another thread may have reloaded already
+    if (mtime != whitelist_mtime) {
+        struct whitelist_entry *old = whitelist_hash;
+        whitelist_hash = new_hash;
+        whitelist_count = count;
+        whitelist_mtime = mtime;
+        new_hash = NULL;  // consumed by swap
+        whitelist_free_hash(old);
     }
     pthread_rwlock_unlock(&whitelist_lock);
+
+    // If we didn't swap (another thread won the race), free unused new_hash
+    if (new_hash) {
+        whitelist_free_hash(new_hash);
+    }
 }
 
 int whitelist_match(const char *domain) {
@@ -119,7 +146,8 @@ int whitelist_is_loaded(void) {
 
 void whitelist_destroy(void) {
     pthread_rwlock_wrlock(&whitelist_lock);
-    whitelist_free_hash_locked();
+    whitelist_free_hash(whitelist_hash);
+    whitelist_hash = NULL;
     whitelist_count = 0;
     whitelist_mtime = 0;
     pthread_rwlock_unlock(&whitelist_lock);

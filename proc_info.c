@@ -147,9 +147,11 @@ void get_cmd_chain(int pid, cmd_chain_struct *chain_struct_info) {
         stat_info = get_proc_stat(stat_info.ppid);
         i++;
     }
-    array_ppid[i] = stat_info.pid;
-    chain_struct_info->array_pids[i] = stat_info.pid;
-    chain_struct_info->start_time[i] = stat_info.starttime / sysconf(_SC_CLK_TCK);
+    if (i < 100) {
+        array_ppid[i] = stat_info.pid;
+        chain_struct_info->array_pids[i] = stat_info.pid;
+        chain_struct_info->start_time[i] = stat_info.starttime / sysconf(_SC_CLK_TCK);
+    }
 
     for (i = 0; i < 100; i++) {
         if (array_ppid[i] == 0) break;
