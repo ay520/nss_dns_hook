@@ -11,7 +11,7 @@ LDFLAGS = -shared -Wl,-soname,libnss_hs.so.2  -lpthread -lresolv
 TARGET = libnss_hs.so.2
 
 # 源文件列表
-SRCS = nss_module.c dns_log.c
+SRCS = nss_module.c whitelist.c dns_cache.c proc_info.c dns_log.c
 
 # 由源文件生成的对象文件列表
 OBJS = $(SRCS:.c=.o)

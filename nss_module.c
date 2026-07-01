@@ -16,17 +16,17 @@
 #include <netinet/in.h>    
 #include <stdbool.h>      
 #include <resolv.h>      
+#include <syslog.h>
 #include "dns_log.h"
-#include "get_cmdchain.c"
+#include "proc_info.h"
+#include "whitelist.h"
+#include "dns_cache.h"
 #include "uthash.h"
 
 // 常量定义
-#define MAX_DOMAIN_LENGTH 256  
-#define MAX_ADDRESSES 16       
-#define DEFAULT_TTL 300       
+#define MAX_ADDRESSES 16
+#define DEFAULT_TTL 300
 #define ALIGN(x) (((x) + sizeof(void*) - 1) & ~(sizeof(void*) - 1))
-#define WHITELIST_FILE "/etc/nss_whitelist.conf"
-#define MAX_WHITELIST_ENTRIES 10000
 
 // 在文件开头添加新的定义
 #define CUSTOM_NETWORKS_FILE "/etc/nss_private_networks.conf"
@@ -239,139 +239,37 @@ static bool is_private_ip(const unsigned char *addr, int family) {
 }
 
 
-struct whitelist_entry {
-    char *domain;            
-    int is_wildcard;        
-    char *suffix;           
-    UT_hash_handle hh;      
-};
-
-static struct whitelist_entry *whitelist_hash = NULL;
-
-static int load_whitelist(void) {
-    FILE *fp = fopen(WHITELIST_FILE, "r");
-    if (!fp) {
-        dns_log(LOG_WARNING, "Could not open whitelist file: %s", WHITELIST_FILE);
-        return 0;
-    }
-
-    char line[MAX_DOMAIN_LENGTH];
-    struct whitelist_entry *entry;
-    int count = 0;
-
-    while (fgets(line, sizeof(line), fp)) {
-        size_t len = strlen(line);
-        if (len > 0 && line[len-1] == '\n') {
-            line[len-1] = '\0';
-        }
-
-        entry = (struct whitelist_entry*)malloc(sizeof(struct whitelist_entry));
-        if (!entry) continue;
-
-        entry->domain = strdup(line);
-        if (!entry->domain) {
-            free(entry);
-            continue;
-        }
-
-        entry->is_wildcard = (entry->domain[0] == '*');
-        if (entry->is_wildcard) {
-            entry->suffix = entry->domain + 1;
-        } else {
-            entry->suffix = NULL;
-        }
-
-        // 使用 HASH_ADD_STR 替代 HASH_ADD_KEYPTR
-        HASH_ADD_STR(whitelist_hash, domain, entry);
-        count++;
-        if(count> MAX_WHITELIST_ENTRIES) 
-        {
-            dns_log(LOG_WARNING,"config file lines more than MAX_WHITELIST_ENTRIES sets");
-            break;
-        }
-    }
-
-    fclose(fp);
-    dns_log(LOG_INFO, "Loaded %d domains into whitelist", count);
-    return count;
-}
-
-static int is_domain_whitelisted(const char *domain) {
-    if (!domain) return 0;
-
-    struct whitelist_entry *entry;
-    
-    // 使用 HASH_FIND_STR 查找
-    HASH_FIND_STR(whitelist_hash, domain, entry);
-    if (entry) return 1;
-
-    // 查找通配符匹配
-    const char *dot = strchr(domain, '.');
-    if (dot) {
-        // 构建通配符形式的域名
-        char wildcard_domain[MAX_DOMAIN_LENGTH];
-        snprintf(wildcard_domain, sizeof(wildcard_domain), "*%s", dot);
-        
-        // 在哈希表中查找通配符域名
-        HASH_FIND_STR(whitelist_hash, wildcard_domain, entry);
-        if (entry) return 1;
-    }
-
-
-    return 0;
-}
-
-static void cleanup_whitelist(void) {
-    struct whitelist_entry *current, *tmp;
-    
-    if (whitelist_hash == NULL) {
-        return;
-    }
-    
-    HASH_ITER(hh, whitelist_hash, current, tmp) {
-        if (current) {
-            HASH_DEL(whitelist_hash, current);
-            if (current->domain) {
-                free(current->domain);
-            }
-            free(current);
-        }
-    }
-    whitelist_hash = NULL;  // 清理后设置为 NULL
-}
-
-
 // 添加一个辅助函数来打印单个地址
 static void print_address(const struct gaih_addrtuple *addr) {
     char ip_str[INET6_ADDRSTRLEN];
-    
+
     if (addr->family == AF_INET) {
         // IPv4 地址
         if (inet_ntop(AF_INET, addr->addr, ip_str, sizeof(ip_str))) {
-            dns_log(LOG_INFO, "IPv4: %s", ip_str);
+            dns_log(LOG_DEBUG, "IPv4: %s", ip_str);
         }
-    } 
+    }
     else if (addr->family == AF_INET6) {
         // IPv6 地址
         if (inet_ntop(AF_INET6, addr->addr, ip_str, sizeof(ip_str))) {
-            dns_log(LOG_INFO, "IPv6: %s", ip_str);
+            dns_log(LOG_DEBUG, "IPv6: %s", ip_str);
         }
     }
 }
 
 // 添加一个函数来打印整个地址链表
 static void print_address_list(const struct gaih_addrtuple *pat) {
-    dns_log(LOG_INFO, "Address list content:");
+    dns_log(LOG_DEBUG, "Address list content:");
     const struct gaih_addrtuple *current = pat;
     int count = 0;
-    
+
     while (current != NULL) {
-        dns_log(LOG_INFO, "Address #%d:", ++count);
+        dns_log(LOG_DEBUG, "Address #%d:", ++count);
         print_address(current);
         current = current->next;
     }
-    
-    dns_log(LOG_INFO, "Total addresses: %d", count);
+
+    dns_log(LOG_DEBUG, "Total addresses: %d", count);
 }
 
 // 安全的内存分配函数
@@ -406,7 +304,7 @@ static bool add_ipv4_address(struct buffer_data *buf,
     unsigned char localhost[4] = {127, 0, 0, 1};
     const unsigned char *final_addr = addr_data;
     
-    if (!is_private && !is_domain_whitelisted(domain)) {
+    if (!is_private && !whitelist_match(domain)) {
         final_addr = localhost;
         char ip_str[48];
         inet_ntop(AF_INET, addr_data, ip_str, sizeof(ip_str));
@@ -451,7 +349,7 @@ static bool add_ipv6_address(struct buffer_data *buf,
     localhost[15] = 1;  // ::1
     const unsigned char *final_addr = addr_data;
     
-    if (!is_private && !is_domain_whitelisted(domain)) {
+    if (!is_private && !whitelist_match(domain)) {
         final_addr = localhost;
         char ip_str[48];
         inet_ntop(AF_INET6, addr_data, ip_str, sizeof(ip_str));
@@ -480,6 +378,59 @@ static bool add_ipv6_address(struct buffer_data *buf,
     return true;
 }
 
+// 从 answer buffer 解析 A 或 AAAA 记录,加到 pat 链表,顺便提取最小 TTL
+// 返回新增地址数(addr_count 的增量);-1 表示解析失败
+static int parse_answer_and_add(
+    struct buffer_data *buf,
+    const unsigned char *answer, int answer_len,
+    int af,
+    struct gaih_addrtuple **pat,
+    struct gaih_addrtuple **prev,
+    int *addr_count,
+    const char *domain,
+    int *out_min_ttl
+) {
+    ns_msg handle;
+    ns_rr rr;
+    int added = 0;
+    int min_ttl = -1;
+
+    if (ns_initparse(answer, answer_len, &handle) < 0) {
+        *out_min_ttl = DEFAULT_TTL;
+        return -1;
+    }
+
+    int count = ns_msg_count(handle, ns_s_an);
+    int rr_type = (af == AF_INET) ? ns_t_a : ns_t_aaaa;
+
+    for (int i = 0; i < count && *addr_count < MAX_ADDRESSES; i++) {
+        if (ns_parserr(&handle, ns_s_an, i, &rr) < 0) {
+            continue;
+        }
+
+        if (ns_rr_type(rr) == rr_type) {
+            int ttl = (int)ns_rr_ttl(rr);
+            if (ttl > 0 && (min_ttl < 0 || ttl < min_ttl)) min_ttl = ttl;
+
+            bool ok;
+            if (af == AF_INET) {
+                ok = add_ipv4_address(buf, pat, prev, ns_rr_rdata(rr), addr_count, domain);
+            } else {
+                ok = add_ipv6_address(buf, pat, prev, ns_rr_rdata(rr), addr_count, domain);
+            }
+            if (ok) {
+                added++;
+            } else {
+                *out_min_ttl = (min_ttl > 0 ? min_ttl : DEFAULT_TTL);
+                return -1;
+            }
+        }
+    }
+
+    *out_min_ttl = (min_ttl > 0 ? min_ttl : DEFAULT_TTL);
+    return added;
+}
+
 // NSS 模块的主要函数
 enum nss_status _nss_hs_gethostbyname4_r(
     const char *name,
@@ -490,131 +441,107 @@ enum nss_status _nss_hs_gethostbyname4_r(
     int *h_errnop,
     int32_t *ttlp)
 {
-    // 参数检查
-    if (!name || !pat || !buffer || !errnop || !h_errnop || 
+    if (!name || !pat || !buffer || !errnop || !h_errnop ||
         buflen < sizeof(struct gaih_addrtuple)) {
         if (errnop) *errnop = EINVAL;
         if (h_errnop) *h_errnop = NO_RECOVERY;
         return NSS_STATUS_UNAVAIL;
     }
 
-
-    char *cmdline=read_cmdline(getpid());
-    char *exe_path=read_proc_path(getpid());
-    dns_log(LOG_INFO, "ns(4) hook domain: %s pid: %d,program:%s,proc_path:%s", name, getpid(),cmdline,exe_path); // 记录日志信息，包括域名和进程ID
+    char *cmdline = read_cmdline(getpid());
+    char *exe_path = read_proc_path(getpid());
+    dns_log(LOG_INFO, "ns(4) hook domain: %s pid: %d program:%s proc_path:%s",
+            name, getpid(),
+            cmdline ? cmdline : "(null)",
+            exe_path ? exe_path : "(null)");
     free(cmdline);
     free(exe_path);
 
-
-    // 检查域名长度
     size_t name_len = strlen(name);
     if (name_len == 0 || name_len >= MAX_DOMAIN_LENGTH) {
         *errnop = EINVAL;
         *h_errnop = NO_RECOVERY;
         return NSS_STATUS_UNAVAIL;
     }
-    if(!load_whitelist()){
 
+    whitelist_check_mtime();
+
+    if (!whitelist_is_loaded()) {
+        dns_log(LOG_INFO, "Whitelist empty, deferring to next NSS module for %s", name);
+        *errnop = ENOENT;
+        *h_errnop = HOST_NOT_FOUND;
         return NSS_STATUS_NOTFOUND;
     }
-    
 
-    // 初始化resolver
-    struct __res_state res;
-    if (res_ninit(&res) != 0) {
-        *errnop = EAGAIN;
-        *h_errnop = NO_RECOVERY;
-        return NSS_STATUS_UNAVAIL;
-    }
-
-    struct buffer_data buf = {
-        .buffer = buffer,
-        .buflen = buflen,
-        .offset = 0
-    };
-
+    struct buffer_data buf = { .buffer = buffer, .buflen = buflen, .offset = 0 };
     unsigned char answer[NS_MAXMSG];
     int addr_count = 0;
     struct gaih_addrtuple *prev = NULL;
+    int min_ttl_a = DEFAULT_TTL, min_ttl_aaaa = DEFAULT_TTL;
 
-    // 查询A记录（IPv4）
-    int len = res_nquery(&res, name, C_IN, T_A, answer, sizeof(answer));
-    if (len > 0) {
-        ns_msg handle;
-        ns_rr rr;
-        
-        if (ns_initparse(answer, len, &handle) >= 0) {
-            int count = ns_msg_count(handle, ns_s_an);
-            for (int i = 0; i < count && addr_count < MAX_ADDRESSES; i++) {
-                if (ns_parserr(&handle, ns_s_an, i, &rr) < 0) {
-                    continue;
-                }
+    unsigned char *cached_a = NULL, *cached_aaaa = NULL;
+    size_t cached_a_len = 0, cached_aaaa_len = 0;
+    int neg_a = 0, neg_aaaa = 0;
 
-                if (ns_rr_type(rr) == ns_t_a) {
-                    if (!add_ipv4_address(&buf, pat, &prev, ns_rr_rdata(rr), &addr_count, name)) {
-                        res_nclose(&res);
-                        *errnop = ERANGE;
-                        *h_errnop = NO_RECOVERY;
-                        return NSS_STATUS_TRYAGAIN;
-                    }
-                }
-            }
+    int cache_hit = dns_cache_get(name, &cached_a, &cached_a_len, &neg_a,
+                                  &cached_aaaa, &cached_aaaa_len, &neg_aaaa);
+
+    if (cache_hit) {
+        dns_log(LOG_DEBUG, "Cache hit for %s", name);
+        if (cached_a && cached_a_len > 0) {
+            parse_answer_and_add(&buf, cached_a, (int)cached_a_len, AF_INET,
+                                 pat, &prev, &addr_count, name, &min_ttl_a);
         }
-    }
-
-    // 查询AAAA记录（IPv6）
-    len = res_nquery(&res, name, C_IN, T_AAAA, answer, sizeof(answer));
-    if (len > 0) {
-        ns_msg handle;
-        ns_rr rr;
-        
-        if (ns_initparse(answer, len, &handle) >= 0) {
-            int count = ns_msg_count(handle, ns_s_an);
-            for (int i = 0; i < count && addr_count < MAX_ADDRESSES; i++) {
-                if (ns_parserr(&handle, ns_s_an, i, &rr) < 0) {
-                    continue;
-                }
-
-                if (ns_rr_type(rr) == ns_t_aaaa) {
-                    if (!add_ipv6_address(&buf, pat, &prev, ns_rr_rdata(rr), &addr_count, name)) {
-                        res_nclose(&res);
-                        *errnop = ERANGE;
-                        *h_errnop = NO_RECOVERY;
-                        return NSS_STATUS_TRYAGAIN;
-                    }
-                }
-            }
+        if (cached_aaaa && cached_aaaa_len > 0) {
+            parse_answer_and_add(&buf, cached_aaaa, (int)cached_aaaa_len, AF_INET6,
+                                 pat, &prev, &addr_count, name, &min_ttl_aaaa);
         }
+    } else {
+        struct __res_state res;
+        if (res_ninit(&res) != 0) {
+            *errnop = EAGAIN;
+            *h_errnop = NO_RECOVERY;
+            return NSS_STATUS_UNAVAIL;
+        }
+
+        int len_a = 0, len_aaaa = 0;
+        int neg_a_local = 0, neg_aaaa_local = 0;
+
+        len_a = res_nquery(&res, name, C_IN, T_A, answer, sizeof(answer));
+        if (len_a > 0) {
+            parse_answer_and_add(&buf, answer, len_a, AF_INET,
+                                 pat, &prev, &addr_count, name, &min_ttl_a);
+        } else {
+            neg_a_local = 1;
+        }
+
+        len_aaaa = res_nquery(&res, name, C_IN, T_AAAA, answer, sizeof(answer));
+        if (len_aaaa > 0) {
+            parse_answer_and_add(&buf, answer, len_aaaa, AF_INET6,
+                                 pat, &prev, &addr_count, name, &min_ttl_aaaa);
+        } else {
+            neg_aaaa_local = 1;
+        }
+
+        res_nclose(&res);
+
+        dns_cache_put(name,
+                      len_a > 0 ? answer : NULL, len_a > 0 ? (size_t)len_a : 0, neg_a_local, min_ttl_a,
+                      len_aaaa > 0 ? answer : NULL, len_aaaa > 0 ? (size_t)len_aaaa : 0, neg_aaaa_local, min_ttl_aaaa);
     }
 
-    // 清理resolver
-    res_nclose(&res);
-    
-    // 安全清理白名单
-    if (whitelist_hash != NULL) {
-        cleanup_whitelist();
-    }
-
-    // 检查是否找到地址
     if (addr_count == 0) {
         dns_log(LOG_INFO, "No addresses found for %s", name);
-       
-        // // 设置错误状态
         *errnop = ENOENT;
         *h_errnop = HOST_NOT_FOUND;
-        
-    
         return NSS_STATUS_NOTFOUND;
-
     }
 
-    // 在返回 SUCCESS 之前添加打印
     if (addr_count > 0) {
-        dns_log(LOG_INFO, "Final address list for %s:", name);
+        dns_log(LOG_DEBUG, "Final address list for %s:", name);
         print_address_list(*pat);
     }
 
-    // 设置TTL
     if (ttlp) {
         *ttlp = DEFAULT_TTL;
     }
@@ -771,11 +698,16 @@ enum nss_status _nss_hs_gethostbyname_r(
 
 // 在模块初始化函数中添加配置加载
 void __attribute__((constructor)) init(void) {
+    openlog("nss_hs", LOG_NDELAY | LOG_PID | LOG_CONS, LOG_LOCAL0);
     load_custom_networks();
+    whitelist_initial_load();
     dns_log(LOG_INFO, "NSS module initialized");
 }
 
 // 在模块清理函数中释放资源
 void __attribute__((destructor)) fini(void) {
+    whitelist_destroy();
+    dns_cache_destroy();
     dns_log(LOG_INFO, "NSS module cleaned up");
+    closelog();
 }
