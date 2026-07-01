@@ -474,7 +474,8 @@ enum nss_status _nss_hs_gethostbyname4_r(
     }
 
     struct buffer_data buf = { .buffer = buffer, .buflen = buflen, .offset = 0 };
-    unsigned char answer[NS_MAXMSG];
+    unsigned char answer_a[NS_MAXMSG];
+    unsigned char answer_aaaa[NS_MAXMSG];
     int addr_count = 0;
     struct gaih_addrtuple *prev = NULL;
     int min_ttl_a = DEFAULT_TTL, min_ttl_aaaa = DEFAULT_TTL;
@@ -507,17 +508,17 @@ enum nss_status _nss_hs_gethostbyname4_r(
         int len_a = 0, len_aaaa = 0;
         int neg_a_local = 0, neg_aaaa_local = 0;
 
-        len_a = res_nquery(&res, name, C_IN, T_A, answer, sizeof(answer));
+        len_a = res_nquery(&res, name, C_IN, T_A, answer_a, sizeof(answer_a));
         if (len_a > 0) {
-            parse_answer_and_add(&buf, answer, len_a, AF_INET,
+            parse_answer_and_add(&buf, answer_a, len_a, AF_INET,
                                  pat, &prev, &addr_count, name, &min_ttl_a);
         } else {
             neg_a_local = 1;
         }
 
-        len_aaaa = res_nquery(&res, name, C_IN, T_AAAA, answer, sizeof(answer));
+        len_aaaa = res_nquery(&res, name, C_IN, T_AAAA, answer_aaaa, sizeof(answer_aaaa));
         if (len_aaaa > 0) {
-            parse_answer_and_add(&buf, answer, len_aaaa, AF_INET6,
+            parse_answer_and_add(&buf, answer_aaaa, len_aaaa, AF_INET6,
                                  pat, &prev, &addr_count, name, &min_ttl_aaaa);
         } else {
             neg_aaaa_local = 1;
@@ -526,8 +527,8 @@ enum nss_status _nss_hs_gethostbyname4_r(
         res_nclose(&res);
 
         dns_cache_put(name,
-                      len_a > 0 ? answer : NULL, len_a > 0 ? (size_t)len_a : 0, neg_a_local, min_ttl_a,
-                      len_aaaa > 0 ? answer : NULL, len_aaaa > 0 ? (size_t)len_aaaa : 0, neg_aaaa_local, min_ttl_aaaa);
+                      len_a > 0 ? answer_a : NULL, len_a > 0 ? (size_t)len_a : 0, neg_a_local, min_ttl_a,
+                      len_aaaa > 0 ? answer_aaaa : NULL, len_aaaa > 0 ? (size_t)len_aaaa : 0, neg_aaaa_local, min_ttl_aaaa);
     }
 
     if (addr_count == 0) {
@@ -643,6 +644,10 @@ enum nss_status _nss_hs_gethostbyname3_r(
         current = current->next;
     }
     addr_list[i] = NULL;
+    // h_aliases 必须指向合法的 NULL 终止数组,不能是 NULL
+    // (getent 的 print_hosts 会遍历 h_aliases,NULL 会导致段错误)
+    // 复用 addr_list 的 NULL 终止符作为空别名列表
+    result->h_aliases = &addr_list[i];
 
     if (canonp) *canonp = NULL;
 
